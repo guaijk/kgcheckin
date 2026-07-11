@@ -1,6 +1,7 @@
 import { printBlue, printGreen, printMagenta, printRed, printYellow } from "./utils/colorOut.js";
 import { hasSecretWriteToken, setRepoSecret } from "./utils/githubSecrets.js";
 import { maskDisplayName, maskIdentifier, sanitizeForLog, summarizeResponse } from "./utils/safeLog.js";
+import { sendNotify } from "./utils/notify.js";
 import { close_api, delay, send, startService } from "./utils/utils.js";
 
 async function main() {
@@ -28,11 +29,14 @@ async function main() {
   const date = yyyy + '-' + MM + '-' + DD
 
   const errorMsg = {}
+  // 通知结果收集
+  const notifyResults = []
+  let hasError = false
+
   try {
     // 开始签到
     for (const user of userinfo) {
       const headers = { 'cookie': 'token=' + user.token + '; userid=' + user.userid }
-      // console.log(headers)
       const userDetail = await send(`/user/detail?timestrap=${Date.now()}`, "GET", headers)
       if (userDetail?.data?.nickname == null) {
         const safeUserId = maskIdentifier(user.userid)
@@ -41,6 +45,15 @@ async function main() {
           msg: `token过期或账号不存在, userid: ${safeUserId}`,
           data: summarizeResponse(userDetail)
         }
+        notifyResults.push({
+          nickname: safeUserId,
+          status: '失败',
+          listen: '账号不存在',
+          vipClaim: '0/8',
+          vipExpiry: '未知',
+          error: 'token过期或账号不存在'
+        })
+        hasError = true
         continue
       }
       const safeNickname = maskDisplayName(userDetail.data.nickname)
@@ -64,23 +77,30 @@ async function main() {
       // 听歌获取vip
       const listen = await send(`/youth/listen/song?timestrap=${Date.now()}`, "GET", headers)
 
+      let listenStatus = '未知'
       if (listen.status === 1) {
         printGreen("听歌领取成功")
+        listenStatus = '成功'
       } else if (listen.error_code === 130012) {
         printGreen("今日已领取")
+        listenStatus = '今日已领取'
       } else {
         errorMsg[`${safeNickname} listen`] = summarizeResponse(listen)
         printRed("听歌领取失败")
+        listenStatus = '失败'
+        hasError = true
       }
 
       printYellow("开始领取VIP...")
+      let claimCount = 0
+      let claimTotal = 0
       for (let i = 1; i <= 8; i++) {
         // ad获取vip
         const ad = await send(`/youth/vip?timestrap=${Date.now()}`, "GET", headers)
-        // 签到出现问题
-        // errorMsg[`${safeNickname} ad${i}`] = summarizeResponse(ad)
+        claimTotal = i
         if (ad.status === 1) {
           printGreen(`第${i}次领取成功`)
+          claimCount++
           if (i != 8) {
             await delay(30 * 1000)
           }
@@ -89,20 +109,32 @@ async function main() {
           break
         } else {
           printRed(`第${i}次领取失败`)
-          // console.dir(ad, { depth: null })
           errorMsg[`${safeNickname} ad`] = summarizeResponse(ad)
+          hasError = true
           break
         }
       }
 
+      let vipExpiry = '未知'
       const vip_details = await send(`/user/vip/detail?timestrap=${Date.now()}`, "GET", headers)
       if (vip_details.status === 1) {
+        vipExpiry = vip_details.data.busi_vip[0].vip_end_time
         printBlue(`今天是：${date}`)
-        printBlue(`VIP到期时间：${vip_details.data.busi_vip[0].vip_end_time}\n`)
+        printBlue(`VIP到期时间：${vipExpiry}\n`)
       } else {
         printRed("获取失败\n")
         errorMsg[`${safeNickname} vip_details`] = summarizeResponse(vip_details)
+        hasError = true
       }
+
+      notifyResults.push({
+        nickname: safeNickname,
+        status: listenStatus === '失败' || claimCount === 0 ? '部分失败' : '成功',
+        listen: listenStatus,
+        vipClaim: `${claimCount}/${claimTotal}`,
+        vipExpiry,
+        error: ''
+      })
     }
 
   } finally {
@@ -128,6 +160,31 @@ async function main() {
 
   }
 
+  // 构建通知内容
+  const title = `酷狗签到${hasError ? '异常' : '成功'} ${date}`
+  let content = `📅 日期: ${date}\n`
+  content += `📊 账号数: ${notifyResults.length}\n`
+  const successCount = notifyResults.filter(r => r.status === '成功').length
+  const failCount = notifyResults.length - successCount
+  content += `✅ 成功: ${successCount}  ❌ 失败: ${failCount}\n`
+
+  for (const r of notifyResults) {
+    content += `\n【${r.nickname}】\n`
+    content += `  🎵 听歌领取: ${r.listen}\n`
+    content += `  🎁 VIP领取: ${r.vipClaim} 次\n`
+    content += `  ⏰ VIP到期: ${r.vipExpiry}\n`
+    if (r.error) {
+      content += `  ⚠️ 错误: ${r.error}\n`
+    }
+  }
+
+  // 发送通知
+  try {
+    await sendNotify(title, content)
+  } catch (e) {
+    printYellow(`通知发送异常: ${e.message}`)
+  }
+
   if (Object.keys(errorMsg).length > 0) {
     printRed("异常信息如下:")
     console.dir(sanitizeForLog(errorMsg), { depth: null })
@@ -140,4 +197,3 @@ async function main() {
 }
 
 main()
-
